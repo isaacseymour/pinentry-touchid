@@ -1,3 +1,15 @@
+# Forked from [jorgelbg/pinentry-touchid][original]
+[original]: https://github.com/jorgelbg/pinentry-touchid
+
+This fork adds support for GPG Smart Cards (e.g. a Yubikey). Unlike a regular
+GPG key, with a smart card, GPG passes a description with the card's serial
+number to pinentry, rather than a full key signature.
+
+This alters the `keychain.GetPIN` function to recognise this, and store the PIN
+in the macOS keychain under that serial number.
+
+The rest of this readme is the same as the original :)
+
 # pinentry-touchid
 
 <p align="center">
@@ -77,7 +89,7 @@ As part of our release process we keep an updated Homebrew Formula. To install `
 Homebrew execute the following commands:
 
 ```sh
-$ brew tap jorgelbg/tap
+$ brew tap isaacseymour/tap
 $ brew install pinentry-touchid
 ```
 
@@ -101,7 +113,7 @@ Homebrew will print the next steps, which will look similar to:
     access again to the keychain entry. Click "Always Allow" after the
     Touch ID verification to prevent this dialog from showing.
 ==> Summary
-🍺  /usr/local/Cellar/pinentry-touchid/0.0.2: 4 files, 2.2MB, built in 10 seconds
+🍺  /usr/local/Cellar/pinentry-touchid/0.0.1: 4 files, 2.2MB, built in 10 seconds
 ```
 
 ### Manual installation
