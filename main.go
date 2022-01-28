@@ -208,6 +208,8 @@ func assuanError(err error) *common.Error {
 	}
 }
 
+// isCardPIN matches the description string against a regexp that looks for a
+// GPG smart card serial number
 func isCardPIN(desc string) bool {
 	return cardSerialRegex.Match([]byte(desc))
 }
@@ -221,6 +223,12 @@ func (c KeychainClient) GetPIN(s pinentry.Settings) (string, *common.Error) {
 	if len(s.Error) == 0 && len(s.RepeatPrompt) == 0 && s.Opts.AllowExtPasswdCache && isCardPIN(s.Desc) {
 		return GetCardPIN(c.authFn, c.promptFn, c.logger)(s)
 	}
+
+	c.logger.Println("cannot use TouchID: not recognised as a GPG key or Smart Card")
+	c.logger.Printf(
+		"options: error: %s; repeat prompt: %s; allow external password cache %t; keyinfo %s; description: %s\n",
+		s.Error, s.RepeatPrompt, s.Opts.AllowExtPasswdCache, s.KeyInfo, s.Desc)
+	c.logger.Println("falling back to pinentry-mac")
 
 	// fallback to pinentry-mac in any other case
 	pin, err := c.promptFn(s)
@@ -271,80 +279,16 @@ func GetPIN(authFn AuthFunc, promptFn PromptFunc, logger *log.Logger) GetPinFunc
 		}
 
 		keychainLabel := fmt.Sprintf("%s <%s> (%s)", name, email, keyID)
-		exists, err := checkEntryInKeychain(keychainLabel)
-		if err != nil {
-			logger.Printf("error checking entry in keychain: %s", err)
-			return "", assuanError(err)
-		}
-
-		// If the entry is not found in the keychain, we trigger `pinentry-mac` with the option
-		// to save the pin in the keychain.
-		//
-		// When trying to access the newly created keychain item we will get the normal password prompt
-		// from the OS, we need to "Always allow" access to our application, still the access from our
-		// app to the keychain item will be guarded by Touch ID.
-		//
-		// Currently I'm not aware of a way for automatically adding our binary to the list of always
-		// allowed apps, see: https://github.com/keybase/go-keychain/issues/54.
-		if !exists {
-			pin, err := promptFn(s)
-			if err != nil {
-				logger.Printf("Error calling pinentry program (%s): %s", pinentryBinary.GetBinary(), err)
-			}
-
-			if len(pin) == 0 {
-				logger.Printf("pinentry-mac didn't return a password")
-				return "", assuanError(fmt.Errorf("pinentry-mac didn't return a password"))
-			}
-
-			// s.KeyInfo is always in the form of x/cacheId
-			// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L357-L362
-			keyInfo := strings.Split(s.KeyInfo, "/")[1]
-
-			// pinentry-mac can create an item in the keychain, if that was the case, the user will have
-			// to authorize our app to access the item without asking for a password from the user. If
-			// not, we create an entry in the keychain, which automatically gives us ownership (i.e the
-			// user will not be asked for a password). In either case, the access to the item will be
-			// guarded by Touch ID.
-			exists, err = checkEntryInKeychain(keychainLabel)
-			if err != nil {
-				logger.Printf("error checking entry in keychain: %s", err)
-				return "", assuanError(err)
-			}
-
-			if !exists {
-				// pinentry-mac didn't create a new entry in the keychain, we create our own and take
-				// ownership over the entry.
-				err = storePasswordInKeychain(keychainLabel, keyInfo, pin)
-
-				if err == keychain.ErrorDuplicateItem {
-					logger.Printf("Duplicated entry in the keychain")
-					return "", assuanError(err)
-				}
-			} else {
-				logger.Printf("The keychain entry was created by pinentry-mac. Permission will be required on next run.")
-			}
-
-			return string(pin), nil
-		}
-
-		var ok bool
-		if ok, err = authFn(fmt.Sprintf("access the PIN for %s", keychainLabel)); err != nil {
-			logger.Printf("Error authenticating with Touch ID: %s", err)
-			return "", assuanError(err)
-		}
-
-		if !ok {
-			logger.Printf("Failed to authenticate")
-			return "", nil
-		}
-
-		password, err := passwordFromKeychain(keychainLabel)
-		if err != nil {
-			log.Printf("Error fetching password from Keychain %s", err)
-		}
-
-		return password, nil
+		// s.KeyInfo is always in the form of x/cacheId
+		// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L357-L362
+		keyInfo := strings.Split(s.KeyInfo, "/")[1]
+		return getPINFromKeychain(
+			func() (bool, error) { return authFn(fmt.Sprintf("access the PIN for %s", keychainLabel)) },
+			promptFn,
+			logger,
+			s,
+			keychainLabel,
+			keyInfo)
 	}
 }
 
@@ -369,78 +313,88 @@ func GetCardPIN(authFn AuthFunc, promptFn PromptFunc, logger *log.Logger) GetPin
 
 		logger.Printf("Loading PIN for smart card with serial %s", serial)
 
-		keychainLabel := fmt.Sprintf("pinentry-touchid smart card %s", serial)
-		exists, err := checkEntryInKeychain(keychainLabel)
+		keychainLabel := fmt.Sprintf("pinentry-touchid-smart-card-%s", serial)
+		return getPINFromKeychain(
+			func() (bool, error) { return authFn(fmt.Sprintf("access the PIN for Card %s", keychainLabel)) },
+			promptFn,
+			logger,
+			s,
+			keychainLabel,
+			"smart-card")
+	}
+}
+
+func getPINFromKeychain(authFn func() (bool, error), promptFn PromptFunc, logger *log.Logger, s pinentry.Settings, keychainLabel, keyInfo string) (string, *common.Error) {
+	exists, err := checkEntryInKeychain(keychainLabel)
+	if err != nil {
+		logger.Printf("error checking entry in keychain: %s", err)
+		return "", assuanError(err)
+	}
+
+	// If the entry is not found in the keychain, we trigger `pinentry-mac` with the option
+	// to save the pin in the keychain.
+	//
+	// When trying to access the newly created keychain item we will get the normal password prompt
+	// from the OS, we need to "Always allow" access to our application, still the access from our
+	// app to the keychain item will be guarded by Touch ID.
+	//
+	// Currently I'm not aware of a way for automatically adding our binary to the list of always
+	// allowed apps, see: https://github.com/keybase/go-keychain/issues/54.
+	if !exists {
+		pin, err := promptFn(s)
+		if err != nil {
+			logger.Printf("Error calling pinentry program (%s): %s", pinentryBinary.GetBinary(), err)
+		}
+
+		if len(pin) == 0 {
+			logger.Printf("pinentry-mac didn't return a password")
+			return "", assuanError(fmt.Errorf("pinentry-mac didn't return a password"))
+		}
+
+		// pinentry-mac can create an item in the keychain, if that was the case, the user will have
+		// to authorize our app to access the item without asking for a password from the user. If
+		// not, we create an entry in the keychain, which automatically gives us ownership (i.e the
+		// user will not be asked for a password). In either case, the access to the item will be
+		// guarded by Touch ID.
+		exists, err = checkEntryInKeychain(keychainLabel)
 		if err != nil {
 			logger.Printf("error checking entry in keychain: %s", err)
 			return "", assuanError(err)
 		}
 
-		// If the entry is not found in the keychain, we trigger `pinentry-mac` with the option
-		// to save the pin in the keychain.
-		//
-		// When trying to access the newly created keychain item we will get the normal password prompt
-		// from the OS, we need to "Always allow" access to our application, still the access from our
-		// app to the keychain item will be guarded by Touch ID.
-		//
-		// Currently I'm not aware of a way for automatically adding our binary to the list of always
-		// allowed apps, see: https://github.com/keybase/go-keychain/issues/54.
 		if !exists {
-			pin, err := promptFn(s)
-			if err != nil {
-				logger.Printf("Error calling pinentry program (%s): %s", pinentryBinary.GetBinary(), err)
-			}
+			// pinentry-mac didn't create a new entry in the keychain, we create our own and take
+			// ownership over the entry.
+			err = storePasswordInKeychain(keychainLabel, keyInfo, pin)
 
-			if len(pin) == 0 {
-				logger.Printf("pinentry-mac didn't return a password")
-				return "", assuanError(fmt.Errorf("pinentry-mac didn't return a password"))
-			}
-
-			// pinentry-mac can create an item in the keychain, if that was the case, the user will have
-			// to authorize our app to access the item without asking for a password from the user. If
-			// not, we create an entry in the keychain, which automatically gives us ownership (i.e the
-			// user will not be asked for a password). In either case, the access to the item will be
-			// guarded by Touch ID.
-			exists, err = checkEntryInKeychain(keychainLabel)
-			if err != nil {
-				logger.Printf("error checking entry in keychain: %s", err)
+			if err == keychain.ErrorDuplicateItem {
+				logger.Printf("Duplicated entry in the keychain: %s", keychainLabel)
 				return "", assuanError(err)
 			}
-
-			if !exists {
-				// pinentry-mac didn't create a new entry in the keychain, we create our own and take
-				// ownership over the entry.
-				err = storePasswordInKeychain(keychainLabel, "smart-card", pin)
-
-				if err == keychain.ErrorDuplicateItem {
-					logger.Printf("Duplicated entry in the keychain: %s", keychainLabel)
-					return "", assuanError(err)
-				}
-			} else {
-				logger.Printf("The keychain entry was created by pinentry-mac. Permission will be required on next run.")
-			}
-
-			return string(pin), nil
+		} else {
+			logger.Printf("The keychain entry was created by pinentry-mac. Permission will be required on next run.")
 		}
 
-		var ok bool
-		if ok, err = authFn(fmt.Sprintf("access the PIN for Card %s", keychainLabel)); err != nil {
-			logger.Printf("Error authenticating with Touch ID: %s", err)
-			return "", assuanError(err)
-		}
-
-		if !ok {
-			logger.Printf("Failed to authenticate")
-			return "", nil
-		}
-
-		password, err := passwordFromKeychain(keychainLabel)
-		if err != nil {
-			log.Printf("Error fetching password from Keychain %s", err)
-		}
-
-		return password, nil
+		return string(pin), nil
 	}
+
+	var ok bool
+	if ok, err = authFn(); err != nil {
+		logger.Printf("Error authenticating with Touch ID: %s", err)
+		return "", assuanError(err)
+	}
+
+	if !ok {
+		logger.Printf("Failed to authenticate")
+		return "", nil
+	}
+
+	password, err := passwordFromKeychain(keychainLabel)
+	if err != nil {
+		log.Printf("Error fetching password from Keychain %s", err)
+	}
+
+	return password, nil
 }
 
 // validatePINBinary validates that the pinentry program returned by gpgconf
