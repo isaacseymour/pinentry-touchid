@@ -46,10 +46,12 @@ const (
 
 var (
 	// DefaultLogLocation is the location of the log file
-	DefaultLogLocation = filepath.Join(filepath.Clean(os.TempDir()), DefaultLogFilename)
+	DefaultLogLocation = filepath.Join(filepath.Clean("/tmp"), DefaultLogFilename)
 
 	emailRegex = regexp.MustCompile(`\"(?P<name>.*<(?P<email>.*)>)\"`)
 	keyIDRegex = regexp.MustCompile(`ID (?P<keyId>.*),`) // keyID should be of exactly 8 or 16 characters
+
+	cardSerialRegex = regexp.MustCompile("Please unlock the card\n\nNumber: (?P<serialNumber>[\\d\\s]+)\n")
 
 	errEmptyResults    = errors.New("no matching entry was found")
 	errMultipleMatches = errors.New("multiple entries matched the query")
@@ -91,6 +93,7 @@ type KeychainClient struct {
 func New() KeychainClient {
 	var logger *log.Logger
 	path := filepath.Clean(DefaultLogLocation)
+	fmt.Fprintf(os.Stderr, "logging to %s\n", path)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		file, err := os.Create(path)
 		if err != nil {
@@ -205,10 +208,18 @@ func assuanError(err error) *common.Error {
 	}
 }
 
+func isCardPIN(desc string) bool {
+	return cardSerialRegex.Match([]byte(desc))
+}
+
 // GetPIN executes the main logic for returning a password/pin back to the gpg-agent
 func (c KeychainClient) GetPIN(s pinentry.Settings) (string, *common.Error) {
 	if len(s.Error) == 0 && len(s.RepeatPrompt) == 0 && s.Opts.AllowExtPasswdCache && len(s.KeyInfo) != 0 {
 		return GetPIN(c.authFn, c.promptFn, c.logger)(s)
+	}
+
+	if len(s.Error) == 0 && len(s.RepeatPrompt) == 0 && s.Opts.AllowExtPasswdCache && isCardPIN(s.Desc) {
+		return GetCardPIN(c.authFn, c.promptFn, c.logger)(s)
 	}
 
 	// fallback to pinentry-mac in any other case
@@ -226,6 +237,7 @@ func (c KeychainClient) Confirm(s pinentry.Settings) (bool, *common.Error) {
 	c.logger.Println("Confirm was called!")
 
 	if _, err := c.promptFn(s); err != nil {
+		c.logger.Printf("Error: %v", err)
 		return false, assuanError(err)
 	}
 
@@ -336,6 +348,101 @@ func GetPIN(authFn AuthFunc, promptFn PromptFunc, logger *log.Logger) GetPinFunc
 	}
 }
 
+// GetCardPIN executes the main logic for returning a password/pin back to the
+// gpg-agent, for unlocking a smart card (e.g. a Yubikey!)
+func GetCardPIN(authFn AuthFunc, promptFn PromptFunc, logger *log.Logger) GetPinFunc {
+	return func(s pinentry.Settings) (string, *common.Error) {
+		matches := cardSerialRegex.FindStringSubmatch(s.Desc)
+		var serial string
+		for i, name := range cardSerialRegex.SubexpNames() {
+			if name == "serialNumber" {
+				serial = matches[i]
+				break
+			}
+		}
+
+		if serial == "" {
+			return "", assuanError(
+				fmt.Errorf("invalid description for smart card:\n%s", s.Desc),
+			)
+		}
+
+		logger.Printf("Loading PIN for smart card with serial %s", serial)
+
+		keychainLabel := fmt.Sprintf("pinentry-touchid smart card %s", serial)
+		exists, err := checkEntryInKeychain(keychainLabel)
+		if err != nil {
+			logger.Printf("error checking entry in keychain: %s", err)
+			return "", assuanError(err)
+		}
+
+		// If the entry is not found in the keychain, we trigger `pinentry-mac` with the option
+		// to save the pin in the keychain.
+		//
+		// When trying to access the newly created keychain item we will get the normal password prompt
+		// from the OS, we need to "Always allow" access to our application, still the access from our
+		// app to the keychain item will be guarded by Touch ID.
+		//
+		// Currently I'm not aware of a way for automatically adding our binary to the list of always
+		// allowed apps, see: https://github.com/keybase/go-keychain/issues/54.
+		if !exists {
+			pin, err := promptFn(s)
+			if err != nil {
+				logger.Printf("Error calling pinentry program (%s): %s", pinentryBinary.GetBinary(), err)
+			}
+
+			if len(pin) == 0 {
+				logger.Printf("pinentry-mac didn't return a password")
+				return "", assuanError(fmt.Errorf("pinentry-mac didn't return a password"))
+			}
+
+			// pinentry-mac can create an item in the keychain, if that was the case, the user will have
+			// to authorize our app to access the item without asking for a password from the user. If
+			// not, we create an entry in the keychain, which automatically gives us ownership (i.e the
+			// user will not be asked for a password). In either case, the access to the item will be
+			// guarded by Touch ID.
+			exists, err = checkEntryInKeychain(keychainLabel)
+			if err != nil {
+				logger.Printf("error checking entry in keychain: %s", err)
+				return "", assuanError(err)
+			}
+
+			if !exists {
+				// pinentry-mac didn't create a new entry in the keychain, we create our own and take
+				// ownership over the entry.
+				err = storePasswordInKeychain(keychainLabel, "smart-card", pin)
+
+				if err == keychain.ErrorDuplicateItem {
+					logger.Printf("Duplicated entry in the keychain: %s", keychainLabel)
+					return "", assuanError(err)
+				}
+			} else {
+				logger.Printf("The keychain entry was created by pinentry-mac. Permission will be required on next run.")
+			}
+
+			return string(pin), nil
+		}
+
+		var ok bool
+		if ok, err = authFn(fmt.Sprintf("access the PIN for Card %s", keychainLabel)); err != nil {
+			logger.Printf("Error authenticating with Touch ID: %s", err)
+			return "", assuanError(err)
+		}
+
+		if !ok {
+			logger.Printf("Failed to authenticate")
+			return "", nil
+		}
+
+		password, err := passwordFromKeychain(keychainLabel)
+		if err != nil {
+			log.Printf("Error fetching password from Keychain %s", err)
+		}
+
+		return password, nil
+	}
+}
+
 // validatePINBinary validates that the pinentry program returned by gpgconf
 // is/points to pinentry-mac
 func validatePINBinary() (string, error) {
@@ -423,6 +530,9 @@ func main() {
 	}
 
 	client := New()
+	if client.logger != nil {
+		pinentry.Logger = *client.logger
+	}
 
 	callbacks := pinentry.Callbacks{
 		GetPIN:  client.GetPIN,
@@ -432,6 +542,7 @@ func main() {
 
 	if err := pinentry.Serve(callbacks, "Hi from pinentry-touchid!"); err != nil {
 		fmt.Fprintf(os.Stderr, "Pinentry Serve returned error: %v\n", err)
+		client.logger.Printf("error from pinentry serve %v\n", err)
 		os.Exit(-1)
 	}
 }
