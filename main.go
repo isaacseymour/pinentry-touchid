@@ -470,6 +470,8 @@ func main() {
 	}
 
 	if *check {
+		fmt.Fprintf(os.Stdout, "%v Logs are at %s\n", emoji.Information, DefaultLogLocation)
+
 		path, err := validatePINBinary()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v %s %s\n", emoji.CrossMark, err, path)
